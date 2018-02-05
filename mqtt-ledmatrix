@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+#------------------------------------------------
+# Settings
+
+# MQTT SETTINGS
+server = "mrmeeseeks.tkkrlab"
+port = 1883
+topic = "tkkrlab/ledmatrix"
+
+# LEDMATRIX SETTINGS
+lmserver = '10.42.1.3'
+lmport = 4242
+matrix_width = 128
+matrix_height = 64
+maxAmountOfLines = 7
+lineHeight = 9
+
+
+# FONT SETTINGS
+font_path = "/srv/fonts/larabie.ttf"
+#font_path = "fonts/LCD_Solid.ttf"
+font_size = 10
+
+#------------------------------------------------
+# Imports
+
+import sys
+import json
+import socket
+import time
+import io
+import datetime
+import numpy
+from PIL import Image, ImageFilter, ImageDraw, ImageFont
+import signal
+import os
+
+try:
+  import paho.mqtt.client as paho
+except:
+  print("The Paho MQTT module for Python has not been installed.")
+  print("Please install the Paho MQTT module by running the following command: ")
+  print("'yaourt -Syyu python-paho-mqtt'")
+  sys.exit(1)
+  
+#------------------------------------------------
+
+print("Ledmatrix controller")
+print("Renze Nicolai 2017")
+print("Version 1.5")
+
+#------------------------------------------------
+# Global variables
+
+line_text = []
+line_fgcolor = []
+line_bgcolor = []
+line_blink = []
+movementOffset = 0
+clearLines = 0
+
+background_brightness = 10
+
+dialog_counter = 200
+dialog_color = (255,0,0)
+dialog_text = "Welcome!"
+dialog_progress = -1
+
+bgimage = Image.new('RGB', (128, 64), (0,0,0))
+bgdata = numpy.zeros([64,128,3],dtype="uint8")
+
+#------------------------------------------------
+# MQTT functions
+
+def on_connect(mosq, obj, rc):
+  global topic
+  if (rc==0):
+    mosq.subscribe(topic, 0)
+  else:
+    print("Fatal error: Could not connect to the MQTT server. (rc="+str(rc)+")")
+    sys.exit(1)
+
+def on_subscribe(mosq, obj, mid, granted_qos):
+    print("[MQTT] Subscribed.")
+
+def on_log(mosq, obj, level, string):
+    print("[MQTT] "+string)
+    
+def on_message(mosq, obj, msg):
+  try:
+      input_string = msg.payload.decode('utf-8')
+  except:
+      return
+  try:
+    json_data = json.loads(input_string)
+    line_add_json(json_data)
+  except:
+    line_add_plain(input_string)
+
+#------------------------------------------------
+# Socket functions
+
+def sendimage_old(sock, image):
+  message = io.BytesIO()
+  image.transpose(Image.FLIP_TOP_BOTTOM).convert('RGB').save(message, 'BMP')
+  message = message.getvalue()[54:]
+  sock.send(message)
+
+def sendimage(sock, image):
+  data = numpy.array(image)
+  sock.send(data)
+   
+#------------------------------------------------
+# Input parse functions
+
+def hex_to_rgb(value):
+  value = value.lstrip('#')
+  lv = len(value)
+  return tuple(int(value[i:i+2], 16) for i in (0, 2 ,4))
+
+def clear_screen():
+  global line_text
+  global line_fgcolor
+  global line_bgcolor
+  global line_blink
+  global movementOffset
+  while len(line_text)>0:
+    line_text.pop(0)
+  while len(line_fgcolor)>0:  
+    line_fgcolor.pop(0)
+  while len(line_bgcolor)>0:
+    line_bgcolor.pop(0)
+  while len(line_blink)>0:
+    line_blink.pop(0)
+  movementOffset = 0
+
+def clear_anim():
+  global clearLines
+  clearLines = len(line_text)
+
+def line_add(text="", fgc=[200,200,200], bgc=[0,0,0], blink=False, clear=False):
+  global line_fgcolor
+  global line_bgcolor
+  global line_text
+  global line_blink
+  
+  global clearLines
+  if (clear):
+    clearLines = len(line_text)
+  
+  line_fgcolor.append(fgc)
+  line_bgcolor.append(bgc)
+  line_text.append(text)
+  line_blink.append(blink)
+  print("Line added: "+text)
+
+def line_add_plain(text):
+    line_add(text, [200,200,200], [0,0,0,0], False, False)
+
+def line_add_json(json_data):
+  global dialog_counter
+  global dialog_color
+  global dialog_text
+  global dialog_progress
+  global background_brightness
+  text = ""
+  fgc = [200,200,200]
+  bgc = [0,0,0]
+  blink = False
+  clear = False
+  instantclear = False
+  noshow = False
+  dialog = 0
+  progress = 0
+  if "bgbr" in json_data:
+    background_brightness = int(json_data["bgbr"])
+  if "text" in json_data:
+    text = json_data["text"]
+  if "color" in json_data:
+    fgc = hex_to_rgb(json_data["color"])
+  if "bgcolor" in json_data:
+    bgc = hex_to_rgb(json_data["bgcolor"])
+  if "blink" in json_data:
+    blink = int(json_data["blink"])
+  if "clear" in json_data:
+    clear = int(json_data["clear"])
+  if "hide" in json_data:
+    noshow = int(json_data["hide"])
+  if "instantclear" in json_data:
+    instantclear = int(json_data["instantclear"])
+  if "dialog" in json_data:
+    dialog = int(json_data["dialog"])
+  if "progress" in json_data:
+    progress = int(json_data["progress"])  
+  if (instantclear):
+    clear_screen()
+  if (dialog>0):
+    dialog_counter = dialog
+    dialog_color = fgc
+    dialog_text = text
+    dialog_progress = progress
+  else:
+    if (noshow==False):
+      line_add(text,fgc,bgc,blink,clear)
+    else:
+      if (clear):
+        clear_anim();
+
+def font_get():
+  global font_path
+  global font_size
+  return ImageFont.truetype(font_path, font_size)
+  
+def check_lines():
+  global line_fgcolor
+  global line_bgcolor
+  global line_text
+  global line_blink
+  a = len(line_fgcolor)
+  b = len(line_bgcolor)
+  c = len(line_text)
+  d = len(line_blink)
+  if (a==b):
+    if (a==c):
+      if (a==d):
+        return True
+  return False
+  
+def draw_lines(movementOffset, blinkState, topLineState, oldImage):
+  global line_fgcolor
+  global line_bgcolor
+  global line_text
+  global line_blink
+  global maxAmountOfLines
+  global lineHeight
+  global matrix_width
+  global bgimage
+  global bgdata
+  
+  image = Image.new('RGB', (128, 64), (0,0,0))
+  if (len(line_text)<1):
+    image.paste(bgimage,(0,0))
+  fnt = font_get()
+  
+  if not check_lines():
+    print("LINE CHECK ERROR")
+    return image
+    
+  try:
+    d = ImageDraw.Draw(image)
+    d.fontmode = "1"
+    amountOfLines = len(line_text)
+    
+    if (amountOfLines>maxAmountOfLines+1):
+      amountOfLines = maxAmountOfLines+1
+      
+    if (amountOfLines>0):
+      for i in range(0,amountOfLines):
+        cR = line_fgcolor[i][0]
+        cG = line_fgcolor[i][1]
+        cB = line_fgcolor[i][2]
+        bcR = line_bgcolor[i][0]
+        bcG = line_bgcolor[i][1]
+        bcB = line_bgcolor[i][2]
+        if (i==0):
+          cR = int((cR * topLineState)/100)
+          cG = int((cG * topLineState)/100)
+          cB = int((cB * topLineState)/100)
+          bcR = int((bcR * topLineState)/100)
+          bcG = int((bcG * topLineState)/100)
+          bcB = int((bcB * topLineState)/100)
+        if (line_blink[i]):
+          if not blinkState:
+            cR = int(cR/2)
+            cG = int(cG/2)
+            cB = int(cB/2)
+        #if ((line_bgcolor[i][0]>0) or (line_bgcolor[i][1]>0) or (line_bgcolor[i][2]>0)):
+        if not (line_fgcolor[i]==line_bgcolor[i]):
+          rect_start = (0,lineHeight*i+movementOffset)
+          rect_end = (matrix_width,lineHeight*(i+1)+movementOffset-1)
+          d.rectangle((rect_start,rect_end),fill=(bcR,bcG,bcB))
+        d.text((0,lineHeight*i+movementOffset-3), line_text[i], font=fnt, fill=(cR,cG,cB))
+  except:
+    print("DRAW EXCEPTION")
+    image = Image.new('RGB', (128, 64), (64,0,0)) #oldImage
+
+  return image
+
+def draw_dialog(img_bg, color, text, progress):
+    global matrix_height
+    global matrix_width
+    
+    image = img_bg
+    image = image.point(lambda i: i * 0.2)
+        
+    fnt = font_get()
+    d = ImageDraw.Draw(image)
+    d.fontmode = "1"
+    
+    colorbg = (int(color[0]/2), int(color[1]/2), int(color[2]/2))
+
+    rect_start = (0,matrix_height-22)
+    rect_end = (matrix_width,matrix_height)
+    d.rectangle((rect_start,rect_end),fill=(10,10,10))
+    
+    rect_start = (0,matrix_height-22)
+    rect_end = (matrix_width,matrix_height-22)
+    d.rectangle((rect_start,rect_end),fill=colorbg)
+
+    if(progress>-1):
+      rect_start = (0,matrix_height-5)
+      rect_end = (matrix_width,matrix_height)
+      d.rectangle((rect_start,rect_end),fill=colorbg)
+      rect_start = (0,matrix_height-5)
+      rect_end = (((matrix_width*progress)/100),matrix_height)
+      d.rectangle((rect_start,rect_end),fill=color)
+    
+    d.text((0,matrix_height-20), text, font=fnt, fill=color)
+    
+    return image
+
+def Main():
+  global server
+  global port
+  global lmserver
+  global lmport
+  global line_text
+  global line_fgcolor
+  global clearLines
+  global movementOffset
+  global background_brightness
+  global dialog_counter
+  global dialog_color
+  global dialog_text
+  global dialog_progress
+        
+  mySocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  mySocket.connect((lmserver,lmport))
+
+  framecounter = 0
+
+  global font_path
+  global font_size
+
+  topLineState = 100
+
+  mqttc = paho.Client()
+  mqttc.on_message = on_message
+  mqttc.on_connect = on_connect
+  mqttc.on_subscribe = on_subscribe
+  print("[DEBUG] Connecting to MQTT server ("+server+":"+str(port)+")...")
+  mqttc.connect(server, port, 60)
+
+  mqttc.loop_start()
+
+  blinkState = False
+  blinkCnt = 15
+  
+  #Socket server test
+  sockserv = socket.socket( socket.AF_INET, socket.SOCK_DGRAM )
+  sockserv.bind(("",4200))
+  sockserv.setblocking(False)
+  #sockserv.listen(5)
+  
+  global bgimage
+  global bgdata
+
+  image = Image.new('RGB', (128, 64), (0,128,128))
+  
+  while True:
+    try:
+      data, addr = sockserv.recvfrom(128*64*3)
+      bgdata = numpy.frombuffer(data,dtype="uint8")
+      bgdata = bgdata * (background_brightness/100)
+      bgdata = bgdata.astype("uint8")
+      bgdata = bgdata.reshape(64,128,3)
+      bgimage = Image.fromarray(bgdata)
+      if (background_brightness<25):
+        background_brightness = background_brightness + 1
+    except:
+      pass
+      #bgdata = bgdata * 0.99
+      #bgdata = bgdata.astype("uint8")
+      #bgdata = bgdata.reshape(64,128,3)
+      #bgimage = Image.fromarray(bgdata)
+      #pass
+
+    if (blinkCnt>0):
+      blinkCnt -= 1
+    else:
+      blinkState = not blinkState
+      blinkCnt = 10
+
+    
+
+    firstLineInvisible = False
+    if (len(line_text)>0):
+    #  if (line_fgcolor[0]==line_bgcolor[0]):
+    #    print("First line is invisible!")
+    #    firstLineInvisible = True
+      if (line_text[0]=="<CLEAR>"):
+        if (line_fgcolor[0]==line_bgcolor[0]):
+          #print("First line is <CLEAR> line!")
+          #line_text[0]="";
+          firstLineInvisible = True
+
+    if (len(line_text)>maxAmountOfLines) or (firstLineInvisible) or (clearLines>0):
+      if (firstLineInvisible):
+        #print("Removed the first line because it is invisible")
+        topLineState = 0
+      if (topLineState>0) and (not (clearLines>0)):
+        #print("Fading away top line")
+        movementOffset = 0
+        topLineState -= 10
+      elif (movementOffset>-lineHeight):
+          movementOffset -= 1
+          #print("Moving top line out of screen "+str(movementOffset))
+      else:
+        #print("Top line has been removed from screen")
+        movementOffset = 0
+        topLineState = 100
+        
+        if (len(line_text)>0):
+          line_text.pop(0)
+          line_fgcolor.pop(0)
+          line_blink.pop(0)
+          line_bgcolor.pop(0)
+          if (clearLines>0):
+            clearLines -= 1
+            background_brightness = 0
+        if (clearLines>0):
+          print("Need to clear "+str(clearLines)+" lines, correcting offset to -1")
+          movementOffset = -1
+      #print("Movement! ("+str(movementOffset)+")")
+    else:
+      topLineState = 100
+
+    image = draw_lines(movementOffset, blinkState, topLineState, image)
+    if (dialog_counter>0):
+      image = draw_dialog(image, dialog_color, dialog_text, dialog_progress)
+      dialog_counter -= 1
+    sendimage(mySocket,image)
+    time.sleep(1/40) #40FPS
+    framecounter += 1
+         
+  mySocket.close()
+ 
+if __name__ == '__main__':
+    Main()
